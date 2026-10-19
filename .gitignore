@@ -1,0 +1,19 @@
+# Build output
+*.shell-extension.zip
+*.mo
+
+# Compiled stylesheet is kept in the tree, but SASS temp files are not
+*.css.map
+
+# Editor and OS noise
+*~
+*.bak
+*.orig
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Local backups of patched sources
+*.pre-gg*
+*.bak-gg

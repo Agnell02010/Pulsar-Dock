@@ -1,0 +1,18 @@
+{
+    "shell-version": [
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+        "50",
+        "51"
+    ],
+    "uuid": "pulsar-dock@inled.es",
+    "name": "Pulsar Dock",
+    "description": "A dock for GNOME Shell customized by Inled Pulsar OS featuring macOS-style hover magnification, launch bounce animations, downloads folder stack and live minimized windows preview. A fork of Dash to Dock by Michele Gaeta (GPL-2.0-or-later).",
+    "original-author": "Inled-Pulsar-OS",
+    "url": "https://github.com/Agnell02010/Pulsar-Dock",
+    "gettext-domain": "dashtodock",
+    "version": 106
+}
