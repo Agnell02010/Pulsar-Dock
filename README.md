@@ -45,8 +45,22 @@ The upstream README is preserved below this section.
 ## Installation
 
 ```sh
-cp -r "pulsar-dock@inled.es" ~/.local/share/gnome-shell/extensions/
-gnome-extensions enable "pulsar-dock@inled.es"
+git clone https://github.com/Agnell02010/Pulsar-Dock.git
+cd Pulsar-Dock
+./install.sh
+```
+
+`install.sh` copies the extension into
+`~/.local/share/gnome-shell/extensions/pulsar-dock@inled.es`, compiles the
+GSettings schema and enables it. It reads the UUID from `metadata.json`, so it
+is safe to re-run and does not depend on the folder's name.
+
+Manual install, if you prefer:
+
+```sh
+mkdir -p ~/.local/share/gnome-shell/extensions/pulsar-dock@inled.es
+cp -r . ~/.local/share/gnome-shell/extensions/pulsar-dock@inled.es/
+gnome-extensions enable pulsar-dock@inled.es
 ```
 
 On Wayland, log out and back in after installing or replacing the extension.

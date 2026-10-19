@@ -1,6 +1,9 @@
 # Build output
 *.shell-extension.zip
-*.mo
+
+# NOTE: locale/*/LC_MESSAGES/*.mo are shipped on purpose. They are compiled
+# from po/ by `make`, but GNOME Shell loads them at runtime and most users
+# install from a clone without running make, so they must stay in the tree.
 
 # Compiled stylesheet is kept in the tree, but SASS temp files are not
 *.css.map
