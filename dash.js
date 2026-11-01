@@ -1248,6 +1248,102 @@ export const DockDash = GObject.registerClass({
         }
     }
 
+    /**
+     * PULSAR-GG8 -- the floating icon that stands in for a magnified dock
+     * icon, rendered sharp.
+     *
+     * The obvious choice, a ClutterClone of the icon already on screen,
+     * magnifies a *picture*: the widget was laid out at the resting size
+     * (48px by default) and the clone scales that raster up to twice its
+     * size, so the hovered icons went soft while the resting ones stayed
+     * sharp. Instead the icon is rendered again at the largest size it will
+     * ever reach (resting size × zoom) and that texture is drawn inside a
+     * slot-sized wrapper: at rest the wrapper shows it scaled *down* to the
+     * dock size, at full magnification the two scales cancel and it is 1:1
+     * with its own texture. The wrapper keeps the exact slot geometry the
+     * clone had, so the row spread, the launch bounce and the retreat keep
+     * working untouched.
+     *
+     * Only real application icons can be re-rendered: the Show Apps tile and
+     * the minimised-window previews have no texture to ask for, so they keep
+     * the plain clone.
+     */
+    _pulsarMagnifyVisual(entry) {
+        const delegate = entry.delegate;
+        const icon = delegate?.icon;
+        const app = delegate?.app;
+        const realIcon = icon?.icon;
+
+        if (!app?.create_icon_texture || !realIcon ||
+            entry.sourceActor !== icon._iconBin) {
+            return new Clutter.Clone({
+                source: entry.sourceActor,
+                reactive: false,
+            });
+        }
+
+        const zoom = Math.max(1,
+            Docking.DockManager.settings.magnificationSizeFactor ||
+            PULSAR_MAGNIFY_ZOOM);
+        let themeScale = 1;
+        try {
+            themeScale =
+                St.ThemeContext.get_for_stage(global.stage).scaleFactor || 1;
+        } catch {}
+
+        const slot = this.iconSize || 48;
+        const hiRes = Math.min(512,
+            Math.max(2, Math.ceil(slot * zoom * themeScale)));
+
+        let hiResIcon = null;
+        try {
+            hiResIcon = app.create_icon_texture(hiRes);
+        } catch {
+            hiResIcon = null;
+        }
+        if (!hiResIcon) {
+            return new Clutter.Clone({
+                source: entry.sourceActor,
+                reactive: false,
+            });
+        }
+
+        // A fixed size, so a layout manager on the wrapper can never shrink
+        // the texture back to the dock size (which would defeat the point).
+        hiResIcon.set_size(hiRes, hiRes);
+        hiResIcon.set_pivot_point(0.5, 0.5);
+        if (typeof realIcon.get_style_class_name === 'function') {
+            const styleClass = realIcon.get_style_class_name();
+            if (styleClass)
+                hiResIcon.set_style_class_name(styleClass);
+        }
+
+        const wrapper = new Clutter.Actor({
+            reactive: false,
+            clip_to_allocation: false,
+            width: slot,
+            height: slot,
+        });
+        wrapper.add_child(hiResIcon);
+        wrapper._pulsarHiRes = hiRes;
+        wrapper._pulsarHiResIcon = hiResIcon;
+        this._pulsarMagnifyFitHiRes(wrapper, slot, slot);
+
+        return wrapper;
+    }
+
+    /** Center the high-resolution texture inside a slot of the given size. */
+    _pulsarMagnifyFitHiRes(actor, width, height) {
+        const hiRes = actor._pulsarHiRes;
+        const icon = actor._pulsarHiResIcon;
+        if (!hiRes || !icon || icon.is_finalized?.())
+            return;
+
+        const scale = Math.min(width / hiRes, height / hiRes);
+        icon.set_position((width - hiRes) / 2, (height - hiRes) / 2);
+        icon.set_scale(scale, scale);
+    }
+
     /** Restore an icon to its resting look (real widget visible, no clone). */
     _pulsarMagnifyRelease(entry) {
         const icon = entry.delegate;
@@ -1487,10 +1583,7 @@ export const DockDash = GObject.registerClass({
                 continue;
 
             if (!clone) {
-                clone = new Clutter.Clone({
-                    source: entry.sourceActor,
-                    reactive: false,
-                });
+                clone = this._pulsarMagnifyVisual(entry);
                 clone.clip_to_allocation = false;
 
                 Main.uiGroup.add_child(clone);
@@ -1537,6 +1630,8 @@ export const DockDash = GObject.registerClass({
 
                 clone.set_position(sourceX, sourceY);
                 clone.set_size(sourceWidth, sourceHeight);
+                this._pulsarMagnifyFitHiRes(
+                    clone, sourceWidth, sourceHeight);
 
                 const cloneSettled = this._pulsarMagnifyEase(clone, {
                     scale_x: targetScale,
