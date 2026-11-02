@@ -70,6 +70,17 @@ const PULSAR_MAGNIFY_PERP_LEAVE = 4;
 const PULSAR_MAGNIFY_LAUNCH_GRACE_FRAMES = 30;
 // PULSAR-GG4A -- per-frame easing of the published panel overflow.
 const PULSAR_MAGNIFY_OVERFLOW_EASE = 0.35;
+// PULSAR-GG9 -- clicks on the part of a magnified icon that grows past the
+// bar are replayed on the real icon: movement up to this many pixels is a
+// click, more is treated as an aborted drag.
+const PULSAR_MAGNIFY_CLICK_SLOP = 8;
+// A held press on a magnified icon opens its menu, the way a long press
+// opens the app menu on macOS.
+const PULSAR_MAGNIFY_LONG_PRESS_MS = 500;
+// PULSAR-GG9 -- after a reorder drop the dock rebuilds its icon list; give
+// the redisplay this long before the row magnifies again, so the first
+// frame does not read the icon the drop just replaced.
+const PULSAR_MAGNIFY_DRAG_SETTLE_MS = 150;
 
 const Labels = Object.freeze({
     SHOW_MOUNTS: Symbol('show-mounts'),
@@ -305,6 +316,18 @@ export const DockDash = GObject.registerClass({
         this._dragPlaceholder = null;
         this._dragPlaceholderPos = -1;
         this._animatingPlaceholdersCount = 0;
+
+        // PULSAR-GG9 -- a reorder drag owns the icons: the hover
+        // magnification is torn down for its duration and does not restart
+        // until the icon is back in the row, otherwise the floating clone
+        // stays behind while the real icon is dragged away.
+        this._pulsarMagDragging = false;
+        this._pulsarMagEndDragTimeoutId = 0;
+        // PULSAR-GG10 -- the icon whose floating picture we are feeding the
+        // pointer hover to, so the dock shows its name (see
+        // _pulsarMagnifySyncHover).
+        this._pulsarMagHoverIcon = null;
+
         this._showLabelTimeoutId = 0;
         this._resetHoverTimeoutId = 0;
         this._labelShowing = false;
@@ -378,6 +401,10 @@ export const DockDash = GObject.registerClass({
             this._pulsarReapplyMagnification();
         });
         this.connect('destroy', () => {
+            if (this._pulsarMagEndDragTimeoutId) {
+                GLib.source_remove(this._pulsarMagEndDragTimeoutId);
+                this._pulsarMagEndDragTimeoutId = 0;
+            }
             try {
                 dockManager.disconnect(this._pulsarDockHideId);
                 dockManager.disconnect(this._pulsarDockShowId);
@@ -753,10 +780,20 @@ export const DockDash = GObject.registerClass({
 
         if (appIcon._draggable) {
             appIcon._draggable.connect('drag-begin', () => {
+                // PULSAR-GG9 -- pull the magnification down *before* the
+                // drag actor is taken out of the dock: the icon that is
+                // dragged is the real one, so there is no frozen floating
+                // copy left behind and the row can shift to make room.
+                this._pulsarMagnifyBeginDrag();
                 appIcon.opacity = 50;
             });
             appIcon._draggable.connect('drag-end', () => {
+                // PULSAR-GG9 -- the drag is over and the icon is back in its
+                // slot: hand the row back to the hover magnification. On a
+                // cancelled drag this only fires after the snap-back
+                // animation, so the row never magnifies a flying icon.
                 appIcon.opacity = 255;
+                this._pulsarMagnifyEndDrag();
             });
         }
 
@@ -848,6 +885,12 @@ export const DockDash = GObject.registerClass({
         this._pulsarPointerX = pointerX;
         this._pulsarPointerY = pointerY;
 
+        // PULSAR-GG9 -- while an icon is being dragged to a new position the
+        // row must stay at rest: magnifying it would move the drop targets
+        // under the pointer and keep the floating clones alive.
+        if (this._pulsarMagDragging)
+            return;
+
         if (!Docking.DockManager.settings.dockMagnification) {
             this._resetMagnification();
             return;
@@ -878,6 +921,9 @@ export const DockDash = GObject.registerClass({
 
     /** Start the frame loop that drives the magnification. */
     _pulsarMagnifyStart() {
+        if (this._pulsarMagDragging)
+            return;
+
         if (this._pulsarMagFrameId)
             return;
 
@@ -1344,6 +1390,222 @@ export const DockDash = GObject.registerClass({
         icon.set_scale(scale, scale);
     }
 
+    // --------------------------------------------------------------------
+    // PULSAR-GG9 -- clicks on the magnified picture.
+    //
+    // The floating picture is not the icon: the real widget stays at its
+    // resting place inside the bar, so the part of the picture that grows
+    // past the bar used to be painted, not clickable. Wherever the pointer
+    // is *not* on a real icon the picture becomes reactive and replays the
+    // press on the real item (activate, menu, long press). On the real
+    // icons themselves it stays transparent to events, so their own click,
+    // drag and gesture handling is untouched.
+    // --------------------------------------------------------------------
+
+    /** True while the pointer is over one of the real (in-bar) icons. */
+    _pulsarPointerOverRealIcon(row, pointerX, pointerY) {
+        for (const entry of row) {
+            const actor = entry.delegate ?? entry.sourceActor;
+            if (!actor?.mapped)
+                continue;
+
+            const [x, y] = actor.get_transformed_position();
+            const [width, height] = actor.get_transformed_size();
+            if (![x, y, width, height].every(Number.isFinite) ||
+                width <= 0 || height <= 0)
+                continue;
+
+            if (pointerX >= x && pointerX < x + width &&
+                pointerY >= y && pointerY < y + height)
+                return true;
+        }
+
+        return false;
+    }
+
+    /** The real dock item a magnified picture stands in for. */
+    _pulsarMagnifyClickTarget(delegate) {
+        if (!delegate)
+            return null;
+
+        // App icons are the interactive item themselves; minimised-window
+        // previews are St.Buttons owning a MetaWindow. Both are activatable.
+        if (typeof delegate.activate === 'function' ||
+            typeof delegate.popupMenu === 'function' ||
+            delegate.metaWindow)
+            return delegate;
+
+        return delegate.icon ?? delegate;
+    }
+
+    _pulsarMagnifyActivate(delegate, button) {
+        const target = this._pulsarMagnifyClickTarget(delegate);
+        if (!target || target.is_finalized?.())
+            return;
+
+        // Mirror the 'clicked' handler of the real item: the row stays
+        // spread while the app the user just clicked is still opening.
+        this._pulsarMagnifyPinLaunch(target);
+
+        if (typeof target.activate === 'function') {
+            target.activate(button);
+            return;
+        }
+
+        if (target.metaWindow) {
+            Main.activateWindow(target.metaWindow);
+            return;
+        }
+
+        target.emit?.('clicked', button);
+    }
+
+    _pulsarMagnifyOpenMenu(delegate) {
+        const target = this._pulsarMagnifyClickTarget(delegate);
+        if (!target || target.is_finalized?.())
+            return;
+
+        if (typeof target.popupMenu === 'function') {
+            target.popupMenu();
+            return;
+        }
+
+        // Minimised-window previews have no menu: a long press just opens
+        // the window, the same as a click.
+        this._pulsarMagnifyActivate(delegate, Clutter.BUTTON_PRIMARY);
+    }
+
+    _pulsarMagnifyCancelLongPress(actor) {
+        if (actor._pulsarPressTimeoutId) {
+            GLib.source_remove(actor._pulsarPressTimeoutId);
+            actor._pulsarPressTimeoutId = 0;
+        }
+    }
+
+    _pulsarMagnifyWireClicks(actor, delegate) {
+        if (!delegate)
+            return;
+
+        actor.connect('button-press-event', (_actor, event) => {
+            if (!actor.reactive)
+                return Clutter.EVENT_PROPAGATE;
+
+            const button = event.get_button();
+            const [x, y] = event.get_coords();
+
+            actor._pulsarPress = {button, x, y, longPressed: false};
+            this._pulsarMagnifyCancelLongPress(actor);
+
+            // A held primary press opens the app menu, like a right click.
+            if (button === Clutter.BUTTON_PRIMARY) {
+                actor._pulsarPressTimeoutId = GLib.timeout_add(
+                    GLib.PRIORITY_DEFAULT,
+                    PULSAR_MAGNIFY_LONG_PRESS_MS,
+                    () => {
+                        actor._pulsarPressTimeoutId = 0;
+                        const press = actor._pulsarPress;
+                        if (!press)
+                            return GLib.SOURCE_REMOVE;
+
+                        const [pointerX, pointerY] = global.get_pointer();
+                        if (Math.hypot(pointerX - press.x,
+                            pointerY - press.y) >
+                            PULSAR_MAGNIFY_CLICK_SLOP)
+                            return GLib.SOURCE_REMOVE;
+
+                        press.longPressed = true;
+                        this._pulsarMagnifyOpenMenu(delegate);
+                        return GLib.SOURCE_REMOVE;
+                    });
+            }
+
+            return Clutter.EVENT_STOP;
+        });
+
+        actor.connect('button-release-event', (_actor, event) => {
+            const press = actor._pulsarPress;
+            if (!press)
+                return Clutter.EVENT_PROPAGATE;
+
+            actor._pulsarPress = null;
+            this._pulsarMagnifyCancelLongPress(actor);
+
+            const [x, y] = event.get_coords();
+            if (press.longPressed ||
+                Math.hypot(x - press.x, y - press.y) >
+                    PULSAR_MAGNIFY_CLICK_SLOP)
+                return Clutter.EVENT_STOP;
+
+            if (press.button === Clutter.BUTTON_SECONDARY)
+                this._pulsarMagnifyOpenMenu(delegate);
+            else
+                this._pulsarMagnifyActivate(delegate, press.button);
+
+            return Clutter.EVENT_STOP;
+        });
+
+        actor.connect('destroy', () => {
+            this._pulsarMagnifyCancelLongPress(actor);
+            actor._pulsarPress = null;
+        });
+    }
+
+    /**
+     * PULSAR-GG9 -- a reorder drag starts on the real icon, which is at
+     * rest inside the bar. The magnification has to be down *before* the
+     * drag machinery lifts that icon out of the row, otherwise the floating
+     * picture stays at its last pose while the real (still hidden) icon is
+     * dragged away.
+     */
+    _pulsarMagnifyBeginDrag() {
+        if (this._pulsarMagDragging)
+            return;
+
+        this._pulsarMagDragging = true;
+        this._resetMagnification();
+    }
+
+    _pulsarMagnifyEndDrag() {
+        if (!this._pulsarMagDragging)
+            return;
+
+        // The drop rebuilds the row (the dragged icon leaves the dock and
+        // the redisplay recreates it): wait for that before handing the row
+        // back, otherwise the first magnification pass reads a disposed
+        // icon. The dragging flag stays set meanwhile, so pointer motion
+        // cannot restart the row early.
+        if (this._pulsarMagEndDragTimeoutId) {
+            GLib.source_remove(this._pulsarMagEndDragTimeoutId);
+            this._pulsarMagEndDragTimeoutId = 0;
+        }
+        this._pulsarMagEndDragTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, PULSAR_MAGNIFY_DRAG_SETTLE_MS, () => {
+                this._pulsarMagEndDragTimeoutId = 0;
+                this._pulsarMagDragging = false;
+                this._pulsarMagnifyReapplyAfterDrag();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _pulsarMagnifyReapplyAfterDrag() {
+        if (!Docking.DockManager.settings.dockMagnification)
+            return;
+
+        // The drop usually ends with the pointer on the dock: hand the row
+        // back to the hover magnification without waiting for a motion.
+        const [pointerX, pointerY] = global.get_pointer();
+        this._pulsarPointerInDock = true;
+        this._pulsarPointerX = pointerX;
+        this._pulsarPointerY = pointerY;
+        if (!this._pulsarMagnifyContains(pointerX, pointerY))
+            return;
+
+        this._pulsarMagRetreating = false;
+        this._pulsarMagActive = true;
+        this._pulsarMagLastPass = 0;
+        this._pulsarMagnifyStart();
+    }
+
     /** Restore an icon to its resting look (real widget visible, no clone). */
     _pulsarMagnifyRelease(entry) {
         const icon = entry.delegate;
@@ -1459,6 +1721,15 @@ export const DockDash = GObject.registerClass({
         const row = this._pulsarMagnifyRow();
         if (!row.length)
             this._pulsarMagActive = false;
+
+        // PULSAR-GG9 -- only a real icon keeps its own events: everywhere
+        // else (the part of the picture that grew past the bar, the gaps
+        // between icons) the floating picture takes the press and replays
+        // it on the real item.
+        const forwardClicks =
+            !this._pulsarMagMenuOpen &&
+            !this._pulsarMagDragging &&
+            !this._pulsarPointerOverRealIcon(row, pointerX, pointerY);
 
         this._pulsarMagnificationClones ??= new Map();
 
@@ -1586,6 +1857,10 @@ export const DockDash = GObject.registerClass({
                 clone = this._pulsarMagnifyVisual(entry);
                 clone.clip_to_allocation = false;
 
+                // PULSAR-GG9 -- the floating picture replays clicks on the
+                // real item while the pointer is outside the bar.
+                this._pulsarMagnifyWireClicks(clone, entry.delegate);
+
                 Main.uiGroup.add_child(clone);
                 this._pulsarMagnificationClones.set(icon, clone);
 
@@ -1649,6 +1924,7 @@ export const DockDash = GObject.registerClass({
             }
 
             clone.show();
+            clone.reactive = forwardClicks && !icon._bouncing;
             this._pulsarMagnifyHideOriginal(entry, clone);
             Main.uiGroup.set_child_above_sibling(clone, null);
         }
@@ -1674,10 +1950,112 @@ export const DockDash = GObject.registerClass({
         // PULSAR-GG3B -- PulsarOS Golden Gate: the app names ride above the
         // magnified pictures, and the glass panel follows the spread, one
         // side at a time.
+        // PULSAR-GG10 -- the app names follow the magnified pictures; the
+        // hover that makes GNOME show them is mirrored from the pointer.
+        this._pulsarMagnifySyncHover(row, zoom, pointerX, pointerY);
         this._pulsarMagnifyPoseLabels(row, zoom);
         this._pulsarMagnifyPublishOverflow(row, zoom);
 
         return settled && this._pulsarMagnificationClones.size === 0;
+    }
+
+    /**
+     * Screen rectangle covered by an entry's magnified picture.
+     *
+     * Mirrors the geometry _pulsarMagnifyPoseLabels uses for the labels:
+     * the clone pivots on the bar side, so the picture keeps that edge and
+     * grows into the air on the opposite one.
+     */
+    _pulsarMagnifyPictureRect(entry, zoom) {
+        // Measure the same actor the floating clone mirrors, so the rect is
+        // exactly the picture the user sees.
+        const actor = entry.sourceActor ?? entry.container;
+        const [x, y] = actor.get_transformed_position();
+        const [width, height] = actor.get_transformed_size();
+        if (![x, y, width, height].every(Number.isFinite) ||
+            width <= 0 || height <= 0)
+            return null;
+
+        const scale = 1 + (zoom - 1) * entry.level;
+        const centerX = x + width / 2;
+        const centerY = y + height / 2;
+
+        let top = centerY - (height * scale) / 2;
+        let bottom = centerY + (height * scale) / 2;
+        let left = centerX - (width * scale) / 2;
+        let right = centerX + (width * scale) / 2;
+
+        if (this._position === St.Side.BOTTOM)
+            top = (y + height) - (height * scale);
+        else if (this._position === St.Side.TOP)
+            bottom = y + (height * scale);
+        else if (this._position === St.Side.LEFT)
+            right = x + (width * scale);
+        else
+            left = (x + width) - (width * scale);
+
+        return {left, top, right, bottom};
+    }
+
+    /**
+     * PULSAR-GG10 -- the app name on the magnified picture.
+     *
+     * The dock label is driven by the real icon's `hover` property (GNOME's
+     * Dash._hookUpLabel listens to notify::hover). The floating picture is
+     * not the icon, so the real widget never sees the pointer over the part
+     * that grew past the bar, and the name never appeared there. Mirror the
+     * pointer onto the hovered entry's real item, leaving St's own tracking
+     * alone wherever the pointer really is over an icon.
+     */
+    _pulsarMagnifySyncHover(row, zoom, pointerX, pointerY) {
+        let hovered = null;
+
+        if (this._pulsarMagActive && !this._pulsarMagMenuOpen &&
+            !this._pulsarMagDragging) {
+            for (const entry of row) {
+                // Only app icons carry a dock label.
+                if (!entry.delegate?.icon)
+                    continue;
+
+                const rect = this._pulsarMagnifyPictureRect(entry, zoom);
+                if (!rect)
+                    continue;
+                if (pointerX >= rect.left && pointerX < rect.right &&
+                    pointerY >= rect.top && pointerY < rect.bottom) {
+                    hovered = entry;
+                    break;
+                }
+            }
+        }
+
+        const icon = hovered?.delegate ?? null;
+        const previous = this._pulsarMagHoverIcon;
+        this._pulsarMagHoverIcon = icon;
+
+        // Drop only a hover we faked ourselves: a real icon under the
+        // pointer is tracked by St and must never be written here.
+        if (previous && previous !== icon &&
+            previous._pulsarHoverFaked) {
+            previous._pulsarHoverFaked = false;
+            if (!previous.is_finalized?.())
+                previous.hover = false;
+        }
+
+        if (!icon || icon.is_finalized?.())
+            return;
+
+        if (hovered &&
+            this._pulsarPointerOverRealIcon([hovered], pointerX, pointerY)) {
+            // The pointer is on the real icon: St owns this hover.
+            icon._pulsarHoverFaked = false;
+            return;
+        }
+
+        // The picture stands in for the icon: feed the hover to the real
+        // item so the label machinery shows the app name above it.
+        icon._pulsarHoverFaked = true;
+        if (!icon.hover)
+            icon.hover = true;
     }
 
     /**
@@ -1952,6 +2330,14 @@ export const DockDash = GObject.registerClass({
         this._pulsarMagActive = false;
         this._pulsarMagnifyUnpinLaunch();
         this._pulsarMagnifyRelaxRow(PULSAR_MAGNIFY_MENU_RELAX_MS);
+
+        // PULSAR-GG9 -- the menu owns the pointer now: the floating
+        // pictures must not intercept a click meant for it while they
+        // ease back to rest.
+        if (this._pulsarMagnificationClones) {
+            for (const clone of this._pulsarMagnificationClones.values())
+                clone.reactive = false;
+        }
     }
 
     _pulsarCleanupClone(icon) {
@@ -2051,6 +2437,16 @@ export const DockDash = GObject.registerClass({
         this._pulsarMagFrozenPose = null;
         this._pulsarMagnifyOverflowSmoothed = null;
         this._pulsarMagnifyPublishOverflow([], 1);
+
+        // PULSAR-GG10 -- release the hover we mirrored onto an icon, but
+        // never one St is tracking because the pointer is really there.
+        const hoveredIcon = this._pulsarMagHoverIcon;
+        this._pulsarMagHoverIcon = null;
+        if (hoveredIcon?._pulsarHoverFaked) {
+            hoveredIcon._pulsarHoverFaked = false;
+            if (!hoveredIcon.is_finalized?.())
+                hoveredIcon.hover = false;
+        }
 
         // Teardown path (feature disabled, dock destroyed): drop the row
         // spread at once instead of animating it.

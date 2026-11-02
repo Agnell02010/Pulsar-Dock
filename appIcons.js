@@ -796,8 +796,6 @@ export const DockAbstractAppIcon = GObject.registerClass({
 
         const bounceEnabled = Docking.DockManager.settings.animateLaunchBounce;
 
-        console.log(`[pulsar-dbg] launch ${this.app?.get_id?.() ?? '?'} mag=${!!magnified} bnc=${!!this._bouncing} iconOp=${this.icon?.opacity ?? -1} bounceOn=${bounceEnabled}`);
-
         if (!magnified && !magnificationOn && !bounceEnabled)
             return;
 
@@ -970,7 +968,6 @@ export const DockAbstractAppIcon = GObject.registerClass({
         }
 
         this._windowsChangedId = this.app.connect('windows-changed', () => {
-            console.log('[pulsar-dbg] settle windows-changed');
             this._windowsChangedId = 0;
             settle();
         });
@@ -981,7 +978,6 @@ export const DockAbstractAppIcon = GObject.registerClass({
         // change means the click did its job.
         this._focusWatchId = global.display.connect(
             'notify::focus-window', () => {
-                console.log('[pulsar-dbg] settle focus');
                 settle();
             });
 
